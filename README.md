@@ -47,6 +47,36 @@ The script is designed for systems like LMDE 6 (Debian-based) and interacts with
    ```
 3. Install dependencies if missing (script will prompt via Zenity; adapt commands for non-Debian systems):
    ```
+
+- A Zenity menu will appear with options.
+- Select modes or toggles; the script handles sudo prompts graphically.
+- Use "Show Current Settings" to view CPU status.
+
+**Example**: To set "Top Mode" for maximum performance, select it from the menu—all changes are applied immediately.
+
+## Warnings
+- **Root Access**: Modifies system files (e.g., `/sys/devices/system/cpu/`), so run as a user with sudo rights.
+- **Hardware-Specific**: Tuned for CPUs with ~14-28 cores/threads (e.g., i9-13900H). Adjust variables like enabled cores in modes if your hardware differs. **Developed on LMDE 6; test thoroughly on other systems to avoid compatibility issues.**
+- **Risks**: Disabling cores or Turbo can cause instability; overclocking equivalents may increase heat/power draw. Monitor with tools like `htop` or `sensors`.
+- **Backup**: Test in a safe environment. No warranty for hardware damage.
+- **Compatibility**: Assumes `intel_pstate` driver; may not work on AMD or non-Intel systems without modifications.
+
+## Customization
+- Edit mode settings (e.g., `ENABLED_CORES` in `lux()`, `trv()`, `eco()`) to match your CPU's processor count (e.g., 14 physical cores on i9-13900H; check with `nproc --all` for logical cores).
+- Frequency calculations are based on a base of 2.6 GHz + increments; adjust in `scaling_max_freq()` for your hardware's max frequency (up to 5.4 GHz on i9-13900H).
+- For non-LMDE systems, modify dependency checks, sudo handling, or sysfs paths as needed.
+
+## License
+This project is licensed under the MIT License. See [LICENSE](LICENSE) for details. (Add a LICENSE file to your repo if desired.)
+
+## Contributing
+Feel free to fork and submit pull requests for improvements, such as AMD support or additional modes.
+
+## Credits
+Developed for personal use on high-performance laptops. Inspired by sysfs CPU tuning guides.
+
+*Last Updated: Monday, 21 July 2025, 09:40 PM*
+
    sudo apt update
    sudo apt install linux-cpupower zenity gksu
    ```
