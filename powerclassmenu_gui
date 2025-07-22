@@ -1,0 +1,321 @@
+#!/usr/bin/env bash
+
+# Source your bashrc or profile
+source ~/.profile
+
+export LC_ALL=en_US.UTF-8  # Ensure proper handling of multibyte characters
+
+# Dependency check
+dependencies=("nproc" "cpupower" "zenity")
+
+missing=()  # Array to store missing dependencies
+
+for dep in "${dependencies[@]}"; do
+    if ! command -v "$dep" &>/dev/null; then
+        missing+=("$dep")
+    fi
+done
+
+if [ "${#missing[@]}" -ne 0 ]; then
+    zenity --error --title="Missing Dependencies" --text="Error: The following dependencies are missing:\n\n$(printf '%s\n' "${missing[@]}" | sed 's/^/sudo apt install /')\n\nPlease install them."
+    exit 1
+fi
+
+# Check if script is run as root (if not, we'll use gksudo or pkexec later for specific commands)
+# Since we're using GUI, we'll handle sudo via graphical prompts rather than failing here
+# Function to run commands with sudo in GUI context
+run_with_sudo() {
+    local command="$*"
+    if command -v gksudo &>/dev/null; then
+        gksudo -- "$command"
+    elif command -v pkexec &>/dev/null; then
+        pkexec bash -c "$command"
+    else
+        zenity --error --title="Error" --text="No graphical sudo tool found. Please install 'gksu' or ensure 'pkexec' is configured."
+        exit 1
+    fi
+}
+
+# Function to get Turbo Boost status
+get_turbo_status() {
+    local no_turbo_file="/sys/devices/system/cpu/intel_pstate/no_turbo"
+    if [ -f "$no_turbo_file" ]; then
+        local turbo_status=$(cat "$no_turbo_file")
+        if [ "$turbo_status" = "0" ]; then
+            echo "Enabled"
+        elif [ "$turbo_status" = "1" ]; then
+            echo "Disabled"
+        else
+            echo "Unknown"
+        fi
+    else
+        echo "Unknown"
+    fi
+}
+
+# Function to get current governor
+get_current_governor() {
+    local governor_file="/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor"
+    if [ -f "$governor_file" ]; then
+        local governor=$(cat "$governor_file" 2>/dev/null)
+        if [ $? -ne 0 ]; then
+            echo "Unknown"
+        else
+            echo "$governor"
+        fi
+    else
+        echo "Unknown"
+    fi
+}
+
+# Function to show current settings (formatted for zenity)
+show() {
+    local no_turbo_file="/sys/devices/system/cpu/intel_pstate/no_turbo"
+    local powercap_file="/sys/class/powercap/intel-rapl:0"
+    local output="Turbo Boost: $(get_turbo_status)\n\nCPU Cores and Governors:\n"
+    local TOTAL_CORES=$(nproc --all)
+
+    for ((i=0; i<TOTAL_CORES; i++)); do
+        local online_file="/sys/devices/system/cpu/cpu$i/online"
+        local governor_file="/sys/devices/system/cpu/cpu$i/cpufreq/scaling_governor"
+        local freq_file="/sys/devices/system/cpu/cpu$i/cpufreq/scaling_max_freq"
+
+        if [ "$i" -eq 0 ]; then
+            local status="Online"
+        else
+            if [ -f "$online_file" ]; then
+                local online_status=$(cat "$online_file")
+                local status=$([ "$online_status" = "1" ] && echo "Online" || echo "Offline")
+            else
+                local status="Unknown"
+            fi
+        fi
+
+        if [[ "$status" == "Online" ]]; then
+            local governor=$( [ -f "$governor_file" ] && cat "$governor_file" 2>/dev/null || echo "Unknown" )
+            local freq=$( [ -f "$freq_file" ] && cat "$freq_file" 2>/dev/null || echo "Unknown" )
+            if [[ "$freq" != "Unknown" ]]; then
+                freq=$(echo "scale=2; $freq / 1000000" | bc)
+                freq="${freq} GHz"
+            fi
+            output="$output  CPU$i: $status, Governor: $governor, Max Frequency: $freq\n"
+        fi
+    done
+
+    if [ -d "$powercap_file" ]; then
+        local lower_limit=$(cat "$powercap_file/constraint_0_power_limit_uw" 2>/dev/null)
+        local upper_limit=$(cat "$powercap_file/constraint_1_power_limit_uw" 2>/dev/null)
+        output="$output\nPower Limits:\n  Lower Limit: $lower_limit uW\n  Upper Limit: $upper_limit uW"
+    else
+        output="$output\nPower Limits: Directory not found"
+    fi
+
+    zenity --info --title="Current CPU Settings" --text="$output" --width=500 --height=400
+}
+
+# Function to toggle turbo on/off
+turbo_off() {
+    local no_turbo_file="/sys/devices/system/cpu/intel_pstate/no_turbo"
+    if [ -f "$no_turbo_file" ]; then
+        local content=$(cat "$no_turbo_file")
+        local new_value=$([ "$content" = "0" ] && echo "1" || echo "0")
+        local action=$([ "$new_value" = "1" ] && echo "Disabling" || echo "Enabling")
+        run_with_sudo "bash -c 'echo $new_value > $no_turbo_file'"
+        if [ $? -eq 0 ]; then
+            zenity --info --title="Turbo Boost" --text="$action Turbo Boost successful."
+        else
+            zenity --error --title="Error" --text="Failed to $action Turbo Boost."
+        fi
+    else
+        zenity --error --title="Error" --text="Turbo Boost file not found."
+    fi
+}
+
+# Function to set power limits
+set_power_limits() {
+    local enabled_cores=$1
+    local powercap_file="/sys/class/powercap/intel-rapl:0"
+    if [ -d "$powercap_file" ]; then
+        local POWER_LOWER=$((enabled_cores*2250000))
+        local POWER_UPPER=$((enabled_cores*5750000))
+        run_with_sudo "bash -c 'echo $POWER_LOWER > $powercap_file/constraint_0_power_limit_uw && echo $POWER_UPPER > $powercap_file/constraint_1_power_limit_uw'"
+        if [ $? -eq 0 ]; then
+            zenity --info --title="Power Limits" --text="Power limits set: Lower: $POWER_LOWER uW, Upper: $POWER_UPPER uW"
+        else
+            zenity --error --title="Error" --text="Failed to set power limits."
+        fi
+    else
+        zenity --error --title="Error" --text="Powercap directory not found."
+    fi
+}
+
+# Function to toggle scaling governor
+governor_toggle() {
+    local current_governor=$(get_current_governor)
+    local new_governor=$([ "$current_governor" = "performance" ] && echo "powersave" || echo "performance")
+    local TOTAL_CORES=$(nproc --all)
+    local success=true
+
+    for ((i=0; i<TOTAL_CORES; i++)); do
+        local governor_file="/sys/devices/system/cpu/cpu$i/cpufreq/scaling_governor"
+        if [ -f "$governor_file" ]; then
+            run_with_sudo "cpupower -c $i frequency-set -g $new_governor"
+            [ $? -ne 0 ] && success=false
+        fi
+    done
+
+    if $success; then
+        zenity --info --title="Governor Change" --text="Governor set to $new_governor for all cores."
+    else
+        zenity --error --title="Error" --text="Failed to set governor for some cores."
+    fi
+}
+
+# Function to set number of enabled cores
+set_cores() {
+    local enabled_cores=$1
+    local TOTAL_CORES=$(nproc --all)
+    if ! [[ "$enabled_cores" =~ ^[0-9]+$ ]] || [ "$enabled_cores" -lt 1 ] || [ "$enabled_cores" -gt "$TOTAL_CORES" ]; then
+        zenity --error --title="Error" --text="Invalid number of enabled cores. Must be between 1 and $TOTAL_CORES."
+        return 1
+    fi
+
+    local success=true
+    for ((i=1; i<enabled_cores; i++)); do
+        local online_file="/sys/devices/system/cpu/cpu$i/online"
+        if [ -f "$online_file" ]; then
+            run_with_sudo "bash -c 'echo 1 > $online_file'" || success=false
+        fi
+    done
+    for ((i=enabled_cores; i<TOTAL_CORES; i++)); do
+        local online_file="/sys/devices/system/cpu/cpu$i/online"
+        if [ -f "$online_file" ]; then
+            run_with_sudo "bash -c 'echo 0 > $online_file'" || success=false
+        fi
+    done
+
+    if ! $success; then
+        zenity --error --title="Error" --text="Failed to set core states for some CPUs."
+    fi
+}
+
+# Function to set maximum frequency for each core (simplified for GUI)
+scaling_max_freq() {
+    local setting=$1
+    local TOTAL_CORES=$(nproc --all)
+    local max_freq=2600000
+    case $setting in
+        "max") max_freq=$((2600000 + 700000*4)) ;;
+        "high") max_freq=$((2600000 + 700000*3)) ;;
+        "mid") max_freq=$((2600000 + 700000*2)) ;;
+        "low") max_freq=$((2600000 + 700000)) ;;
+        "min") max_freq=2600000 ;;
+        *) zenity --error --title="Error" --text="Invalid frequency setting."; return 1 ;;
+    esac
+    local min_freq=$max_freq
+    local success=true
+
+    for ((core=0; core<TOTAL_CORES; core++)); do
+        local max_freq_file="/sys/devices/system/cpu/cpu$core/cpufreq/scaling_max_freq"
+        local min_freq_file="/sys/devices/system/cpu/cpu$core/cpufreq/scaling_min_freq"
+        if [ -f "$max_freq_file" ]; then
+            run_with_sudo "bash -c 'echo $max_freq > $max_freq_file'" || success=false
+        fi
+        if [ -f "$min_freq_file" ]; then
+            run_with_sudo "bash -c 'echo $min_freq > $min_freq_file'" || success=false
+        fi
+    done
+
+    if $success; then
+        zenity --info --title="Frequency Set" --text="Frequency set to $setting."
+    else
+        zenity --error --title="Error" --text="Failed to set frequency for some cores."
+    fi
+}
+
+# Power mode functions
+top() {
+    local TOTAL_CORES=$(nproc --all)
+    set_cores $TOTAL_CORES
+    governor_toggle "performance"
+    scaling_max_freq "max"
+    set_power_limits $TOTAL_CORES
+    run_with_sudo "bash -c 'echo 0 > /sys/devices/system/cpu/intel_pstate/no_turbo'"
+    zenity --info --title="Top Mode" --text="Top mode set: All cores online with performance governor and turbo enabled."
+    show
+}
+
+lux() {
+    local ENABLED_CORES=15
+    set_cores $ENABLED_CORES
+    governor_toggle "performance"
+    scaling_max_freq "high"
+    set_power_limits $ENABLED_CORES
+    run_with_sudo "bash -c 'echo 1 > /sys/devices/system/cpu/intel_pstate/no_turbo'"
+    zenity --info --title="Luxury Mode" --text="Luxury mode set: Cores 0-14 online with performance governor and turbo disabled."
+    show
+}
+
+trv() {
+    local ENABLED_CORES=10
+    set_cores $ENABLED_CORES
+    governor_toggle "powersave"
+    scaling_max_freq "low"
+    set_power_limits $ENABLED_CORES
+    run_with_sudo "bash -c 'echo 1 > /sys/devices/system/cpu/intel_pstate/no_turbo'"
+    zenity --info --title="Traveller Mode" --text="Traveller mode set: Cores 0-9 online with powersave governor and turbo disabled."
+    show
+}
+
+eco() {
+    local ENABLED_CORES=5
+    set_cores $ENABLED_CORES
+    governor_toggle "powersave"
+    scaling_max_freq "min"
+    set_power_limits $ENABLED_CORES
+    run_with_sudo "bash -c 'echo 1 > /sys/devices/system/cpu/intel_pstate/no_turbo'"
+    zenity --info --title="Eco Mode" --text="Eco mode set: Cores 0-4 online with powersave governor and turbo disabled."
+    show
+}
+
+# Main Menu Function with Zenity
+main_menu() {
+    while true; do
+        local current_turbo=$(get_turbo_status)
+        local current_governor=$(get_current_governor)
+        local choice=$(zenity --list --title="CPU Power Management Menu" --text="Turbo Boost: $current_turbo\nGovernor: $current_governor\n\nSelect an option:" \
+            --column="Option" --width=400 --height=400 \
+            "Toggle Turbo Boost" \
+            "Set to Top Mode" \
+            "Set to Luxury Mode" \
+            "Set to Traveller Mode" \
+            "Set to Economy Mode" \
+            "Show Current Settings" \
+            "Toggle Governor" \
+            "Set Frequency" \
+            "Exit")
+        
+        case "$choice" in
+            "Toggle Turbo Boost") turbo_off ;;
+            "Set to Top Mode") top ;;
+            "Set to Luxury Mode") lux ;;
+            "Set to Traveller Mode") trv ;;
+            "Set to Economy Mode") eco ;;
+            "Show Current Settings") show ;;
+            "Toggle Governor") governor_toggle ;;
+            "Set Frequency")
+                local freq_choice=$(zenity --list --title="Set Frequency" --text="Select frequency setting:" \
+                    --column="Setting" --width=300 --height=300 \
+                    "max" "high" "mid" "low" "min")
+                [ -n "$freq_choice" ] && scaling_max_freq "$freq_choice"
+                ;;
+            "Exit"|"") exit 0 ;;
+            *) zenity --error --title="Error" --text="Invalid option." ;;
+        esac
+    done
+}
+
+# Start the menu
+main_menu
+
+exit 0
